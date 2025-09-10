@@ -21,10 +21,10 @@ type DatadogAggregator = Arc<ThreadLocalAggregator<io::Result<Vec<JoinHandle<()>
 /// and defaults to the `DD_API_KEY` env variable if no explicit Datadog API key has been given.
 ///
 /// Calling [`try_init`](DatadogBuilder::try_init) will configure a global dispatcher and return a [`DatadogFlusher`].
-pub fn datadog(api_key: impl Into<Option<String>>) -> DatadogBuilder {
+pub fn datadog<'a>(api_key: impl Into<Option<&'a str>>) -> DatadogBuilder {
     let api_key = api_key
         .into()
-        .map(Ok)
+        .map(|s| Ok(s.into()))
         .unwrap_or_else(|| std::env::var("DD_API_KEY").map_err(io::Error::other));
     let ddog_site = match std::env::var("DD_SITE") {
         Ok(site) => Ok(Some(format!("https://api.{site}"))),

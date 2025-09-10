@@ -16,7 +16,7 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() {
     // Or `None`, which defaults to using the `DD_API_KEY` env.
-    let flusher = merni::init_datadog("datadog API key").unwrap();
+    let flusher = merni::datadog("datadog API key").try_init().unwrap();
 
     // Later on, anywhere in your code:
     merni::counter!("some.counter": 1);
