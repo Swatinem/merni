@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -16,6 +15,136 @@ use crate::{
 
 type DatadogAggregator = Arc<ThreadLocalAggregator<io::Result<Vec<JoinHandle<()>>>>>;
 
+/// Creates a [`DatadogBuilder`] with sensible defaults.
+///
+/// By default, it runs on the "current" tokio runtime, flushes metrics every 10 seconds,
+/// and defaults to the `DD_API_KEY` env variable if no explicit Datadog API key has been given.
+///
+/// Calling [`try_init`](DatadogBuilder::try_init) will configure a global dispatcher and return a [`DatadogFlusher`].
+pub fn datadog(api_key: impl Into<Option<String>>) -> DatadogBuilder {
+    let api_key = api_key
+        .into()
+        .map(Ok)
+        .unwrap_or_else(|| std::env::var("DD_API_KEY").map_err(io::Error::other));
+    let ddog_site = match std::env::var("DD_SITE") {
+        Ok(site) => Ok(Some(format!("https://api.{site}"))),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(io::Error::other(err)),
+    };
+
+    DatadogBuilder {
+        runtime: None,
+        flush_interval: Duration::from_secs(10),
+
+        api_key,
+        ddog_site,
+
+        prefix: String::new(),
+        global_tags: String::new(),
+    }
+}
+
+/// A builder for configuring common datadog options.
+pub struct DatadogBuilder {
+    runtime: Option<Handle>,
+    flush_interval: Duration,
+
+    api_key: io::Result<String>,
+    ddog_site: io::Result<Option<String>>,
+
+    prefix: String,
+    global_tags: String,
+}
+
+impl DatadogBuilder {
+    /// Sets a global prefix to all the emitted metrics.
+    ///
+    /// For example, this could be `"myservice."`.
+    pub fn prefix(mut self, prefix: &str) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+
+    /// Adds a global tag to all the emitted metrics.
+    ///
+    /// For example, this could be something like `"hostname"`, or similar.
+    pub fn global_tag(mut self, key: &str, value: &str) -> Self {
+        if !self.global_tags.is_empty() {
+            self.global_tags.push(',');
+        }
+        let formatted_tag = format!("{key}:{value}");
+        let formatted_tag = serde_json::to_string(&formatted_tag).unwrap();
+        self.global_tags.push_str(&formatted_tag);
+        self
+    }
+
+    /// Explicitly sets a tokio runtime [`Handle`] to use for the flusher thread.
+    pub fn runtime(mut self, runtime: Handle) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// Explicitly sets the upstream datadog site.
+    ///
+    /// This defaults to the `DD_SITE` env variable, or `https://api.datadoghq.com` otherwise.
+    pub fn ddog_site(mut self, ddog_site: &str) -> Self {
+        self.ddog_site = Ok(Some(ddog_site.into()));
+        self
+    }
+
+    /// Explicitly sets a flush interval.
+    ///
+    /// This defaults to 10 seconds.
+    pub fn flush_interval(mut self, flush_interval: Duration) -> Self {
+        self.flush_interval = flush_interval;
+        self
+    }
+
+    /// Turns the builder into a [`DatadogSink`].
+    pub fn into_sink(self) -> io::Result<DatadogSink> {
+        let runtime = self.runtime.unwrap_or_else(Handle::current);
+        let api_key = self.api_key?;
+        let ddog_site = self.ddog_site?;
+
+        Ok(DatadogSink {
+            runtime,
+            client: reqwest::ClientBuilder::new()
+                .build()
+                .map_err(io::Error::other)?,
+            api_key,
+            ddog_site: ddog_site
+                .as_deref()
+                .unwrap_or(DD_SITE)
+                .trim_end_matches('/')
+                .into(),
+
+            join_handles: Vec::new(),
+
+            metric_buf: Vec::with_capacity(MAX_COMPRESSED),
+            scratch_buf: String::new(),
+            prefix: self.prefix,
+            global_tags: self.global_tags,
+
+            next_flush_len: MAX_COMPRESSED - THRESHOLD,
+            bytes_written: 0,
+            cctx: Encoder::new(0)?,
+            compression_buffer: Vec::with_capacity(MAX_COMPRESSED),
+        })
+    }
+
+    /// Initializes the datadog sink and aggregator, registering it as a global dispatcher.
+    pub fn try_init(self) -> io::Result<DatadogFlusher> {
+        let flush_interval = self.flush_interval;
+        let datadog = self.into_sink()?;
+
+        let aggregator = Arc::new(ThreadLocalAggregator::new(flush_interval, datadog));
+        let dispatcher = Dispatcher::new(Arc::clone(&aggregator));
+        set_global_dispatcher(dispatcher)
+            .map_err(|_| io::Error::other("unable to set global dispatcher"))?;
+        Ok(DatadogFlusher { aggregator })
+    }
+}
+
 /// This is a wrapper struct that allows flushing aggregated metrics to Datadog.
 pub struct DatadogFlusher {
     aggregator: DatadogAggregator,
@@ -32,45 +161,19 @@ impl DatadogFlusher {
     }
 }
 
-/// This is a shortcut to configure the Datadog sink with sensible defaults.
-///
-/// It runs on the "current" tokio runtime, flushes metrics every 10 seconds,
-/// and defaults to the `DD_API_KEY` env variable if no explicit Datadog API key has been given.
-/// This will also install the dispatcher globally.
-pub fn init_datadog<'a>(api_key: impl Into<Option<&'a str>>) -> io::Result<DatadogFlusher> {
-    let api_key = if let Some(api_key) = api_key.into() {
-        Cow::Borrowed(api_key)
-    } else {
-        let api_key = std::env::var("DD_API_KEY").map_err(io::Error::other)?;
-        Cow::Owned(api_key)
-    };
-
-    init_with_key(&api_key)
-}
-
-fn init_with_key(api_key: &str) -> io::Result<DatadogFlusher> {
-    let runtime = Handle::current();
-    let flush_interval = Duration::from_secs(10);
-
-    let datadog = DatadogSink::new(runtime, api_key, None)?;
-    let aggregator = Arc::new(ThreadLocalAggregator::new(flush_interval, datadog));
-    let dispatcher = Dispatcher::new(Arc::clone(&aggregator));
-    set_global_dispatcher(dispatcher)
-        .map_err(|_| io::Error::other("unable to set global dispatcher"))?;
-    Ok(DatadogFlusher { aggregator })
-}
-
 /// An aggregator sink which pushes metrics to Datadog, using the Datadog API.
 pub struct DatadogSink {
     runtime: Handle,
     client: reqwest::Client,
     api_key: String,
-    site: String,
+    ddog_site: String,
 
     join_handles: Vec<JoinHandle<()>>,
 
     metric_buf: Vec<u8>,
-    tag_buf: String,
+    scratch_buf: String,
+    prefix: String,
+    global_tags: String,
 
     next_flush_len: usize,
     bytes_written: usize,
@@ -95,31 +198,6 @@ const DISTRIBUTION_ENDPOINT: &str = "/api/v1/distribution_points";
 const METRICS_ENDPOINT: &str = "/api/v2/series";
 
 impl DatadogSink {
-    /// Creates a new Sink.
-    ///
-    /// It needs to be configured with a Datadog API key, and optional server.
-    /// The sink also needs a tokio runtime handle on which it will spawn outgoing requests.
-    pub fn new(runtime: Handle, api_key: &str, dd_server: Option<&str>) -> io::Result<Self> {
-        Ok(Self {
-            runtime,
-            client: reqwest::ClientBuilder::new()
-                .build()
-                .map_err(io::Error::other)?,
-            api_key: api_key.into(),
-            site: dd_server.unwrap_or(DD_SITE).trim_end_matches('/').into(),
-
-            join_handles: Vec::new(),
-
-            metric_buf: Vec::with_capacity(MAX_COMPRESSED),
-            tag_buf: String::new(),
-
-            next_flush_len: MAX_COMPRESSED - THRESHOLD,
-            bytes_written: 0,
-            cctx: Encoder::new(0)?,
-            compression_buffer: Vec::with_capacity(MAX_COMPRESSED),
-        })
-    }
-
     fn emit_metrics(&mut self, metrics: Aggregations) -> io::Result<Vec<JoinHandle<()>>> {
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -193,7 +271,7 @@ impl DatadogSink {
 
         let request = self
             .client
-            .post(format!("{}{endpoint}", self.site))
+            .post(format!("{}{endpoint}", self.ddog_site))
             .header("DD-API-KEY", &self.api_key)
             .header(header::ACCEPT, "application/json")
             .header(header::CONTENT_ENCODING, "zstd")
@@ -255,23 +333,32 @@ impl DatadogSink {
     }
 
     fn write_meta(&mut self, meta: &AggregatedMetric) -> io::Result<()> {
+        self.scratch_buf.clear();
+        self.scratch_buf.push_str(&self.prefix);
+        self.scratch_buf.push_str(meta.key());
+
         self.metric_buf.extend_from_slice(br#"{"metric":"#);
-        serde_json::to_writer(&mut self.metric_buf, meta.key()).map_err(io::Error::other)?;
+        serde_json::to_writer(&mut self.metric_buf, &self.scratch_buf).map_err(io::Error::other)?;
         self.metric_buf.push(b',');
 
         let tags = meta.tags();
-        if tags.len() > 0 {
+        if tags.len() > 0 || !self.global_tags.is_empty() {
             self.metric_buf.extend_from_slice(br#""tags":["#);
+            self.metric_buf
+                .extend_from_slice(self.global_tags.as_bytes());
+            if !self.global_tags.is_empty() && tags.len() > 0 {
+                self.metric_buf.push(b',');
+            }
             for (i, tag) in tags.enumerate() {
-                self.tag_buf.clear();
-                self.tag_buf.push_str(tag.0);
-                self.tag_buf.push(':');
-                self.tag_buf.push_str(tag.1);
+                self.scratch_buf.clear();
+                self.scratch_buf.push_str(tag.0);
+                self.scratch_buf.push(':');
+                self.scratch_buf.push_str(tag.1);
 
                 if i > 0 {
                     self.metric_buf.push(b',');
                 }
-                serde_json::to_writer(&mut self.metric_buf, &self.tag_buf)
+                serde_json::to_writer(&mut self.metric_buf, &self.scratch_buf)
                     .map_err(io::Error::other)?;
             }
             self.metric_buf.extend_from_slice(br#"],"#);

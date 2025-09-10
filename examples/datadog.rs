@@ -2,11 +2,14 @@ use merni::{counter, distribution};
 
 #[tokio::main]
 async fn main() {
-    let flusher = merni::init_datadog(None).unwrap();
+    let flusher = merni::datadog(None)
+        .prefix("merni.test.")
+        .try_init()
+        .unwrap();
 
     for _ in 0..10 {
-        counter!("merni.test.counter": 1);
-        distribution!("merni.test.distribution": 1);
+        counter!("counter": 1);
+        distribution!("distribution": 1);
     }
 
     flusher.flush(None).await.unwrap();
