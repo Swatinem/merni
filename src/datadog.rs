@@ -69,12 +69,13 @@ impl DatadogBuilder {
     ///
     /// For example, this could be something like `"hostname"`, or similar.
     pub fn global_tag(mut self, key: &str, value: &str) -> Self {
-        if !self.global_tags.is_empty() {
-            self.global_tags.push(',');
-        }
         let formatted_tag = format!("{key}:{value}");
-        let formatted_tag = serde_json::to_string(&formatted_tag).unwrap();
-        self.global_tags.push_str(&formatted_tag);
+        if let Ok(formatted_tag) = serde_json::to_string(&formatted_tag) {
+            if !self.global_tags.is_empty() {
+                self.global_tags.push(',');
+            }
+            self.global_tags.push_str(&formatted_tag);
+        }
         self
     }
 
@@ -217,8 +218,9 @@ impl DatadogSink {
             let mut rest = values.values.as_slice();
             while !rest.is_empty() {
                 let num_values = (self.next_flush_len / BYTES_PER_POINT).min(rest.len());
-                let values = rest.split_off(..num_values).unwrap();
-                self.push_distribution(&meta, timestamp, values)?;
+                if let Some(values) = rest.split_off(..num_values) {
+                    self.push_distribution(&meta, timestamp, values)?;
+                }
             }
         }
         self.flush(DISTRIBUTION_ENDPOINT)?;
@@ -289,10 +291,14 @@ impl DatadogSink {
             .send();
 
         self.join_handles.push(self.runtime.spawn(async move {
-            // TODO: handle errors happening during error handling
-            let response = request.await.unwrap();
+            let response = match request.await {
+                Ok(resp) => resp,
+                Err(err) => return eprintln!("merni: error submitting metrics to datadog (err={err})"),
+            };
+
             if let Err(err) = response.error_for_status_ref() {
-                let response_text = response.text().await.unwrap();
+                let text_result = response.text().await;
+                let response_text = text_result.as_deref().unwrap_or("<unable to read response>");
 
                 eprintln!("merni: error submitting metrics to datadog (err={err}, response={response_text})");
             }
