@@ -126,6 +126,7 @@ impl DatadogBuilder {
             prefix: self.prefix,
             global_tags: self.global_tags,
 
+            flush_interval_secs: self.flush_interval.as_secs(),
             next_flush_len: MAX_COMPRESSED - THRESHOLD,
             bytes_written: 0,
             cctx: Encoder::new(0)?,
@@ -176,6 +177,7 @@ pub struct DatadogSink {
     prefix: String,
     global_tags: String,
 
+    flush_interval_secs: u64,
     next_flush_len: usize,
     bytes_written: usize,
     cctx: Encoder<'static>,
@@ -360,6 +362,11 @@ impl DatadogSink {
         self.metric_buf.extend_from_slice(br#"{"metric":"#);
         serde_json::to_writer(&mut self.metric_buf, &self.scratch_buf).map_err(io::Error::other)?;
         self.metric_buf.push(b',');
+
+        if matches!(meta.meta.ty(), MetricType::Counter) {
+            self.metric_buf
+                .write_fmt(format_args!(r#""interval":{},"#, self.flush_interval_secs))?;
+        }
 
         let tags = meta.tags();
         if tags.len() > 0 || !self.global_tags.is_empty() {
