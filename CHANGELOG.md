@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3 (2025-10-28)
+
+- Send the interval alongside counters for datadog
+
 ## 0.1.2 (2025-10-22)
 
 - Avoid panics in datadog flusher
